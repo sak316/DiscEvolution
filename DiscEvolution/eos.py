@@ -3,6 +3,7 @@ import numpy as np
 from .brent import brentq
 from .constants import GasConst, sig_SB, AU, Omega0
 from . import opacity
+from .chambers_config import Config, Constants
 ################################################################################
 # Thermodynamics classes
 ################################################################################
@@ -511,10 +512,156 @@ def from_file(filename):
                 continue
 
 
+import astropy.units as u
+
+class ChambersEOS(EOS_Table):
+    boltz = 1.3806e-16 *u.erg / u.K # boltzmann constant
+    mH = 1.67e-24 *u.g # mass of hydrogen atom in grams
+    mu = 2.34 
+    gamma = 1.4
+    sig_SB = 5.6704e-5 * u.erg / u.cm**2 / u.s / u.K**4 # Stefan-Boltzmann constant, cgs
+    
+    def __init__(self, star, sigma0, r0, T0, v0, fw, K, Tevap, rexp, k0): # tol is no longer used
+        super(ChambersEOS, self).__init__()
+
+        self._star = star
+        self.sigma0 = sigma0
+        self.r0 = r0
+        self.T0 = T0
+        self.v0 = v0
+        self.fw = fw
+        self.K = K
+        self.Tevap = Tevap
+        self.rexp = rexp
+        self.k0 = k0
+
+        self._star = star
+        
+        self._T = None
+        self._time = 0
+
+        self.config = Config
+
+    def calculate_T(self, dt, star):
+        sig_SB = 5.6704e-5 * u.erg / u.cm**2 / u.s / u.K**4 # Stefan-Boltzmann constant, cgs
+        G = 6.67430e-8 * u.cm**3 / (u.g * u.s**2) # Gravitational constant, cgs
+        
+        dt = ((self._time-dt)/(2*np.pi)) * u.yr
+
+        if star:
+            self._star = star
+            
+        Mstar = self._star.M * u.Msun
+        R = self._R * u.AU
+
+        s0 = np.sqrt(self.rexp / self.r0)
+
+        # part of Equation 37
+        V = self.Tevap/self.T0
+
+        Atop = 9*(1-self.fw)*G*Mstar*self.k0*(self.sigma0**2)*self.v0
+        Abottom = 32*sig_SB*(self.r0**2)*(self.T0**4)
+        A = np.sqrt(Atop/Abottom)
+
+        x = (R/self.r0)**(1/2)
+
+        # Equation 39
+        p0 = A*(V**(1/2)) * ((A**2 + 1) / (A**2 + V**3))**(1/6)
+        J = self.fw / (1-self.fw)
+        n = -1 - (2/5) * ((1+J)**2 + 8*J*self.K)**(1/2)
+        b = ((1-J)/2) + (1/2) * ((1+J)**2 + 8*J*self.K)**(1/2)
+        tau = (8 * self.r0 * s0**(5/2)) / (25 * self.v0 * (1-self.fw))
+
+        # Equation 38
+        p1 = p0 * (1 + (dt/tau))**n * (x**b)
+        p2 = np.exp((1/s0)**(5/2) - (x/s0)**(5/2)*(1 + dt/tau)**(-1))
+        p = p1 * p2
+
+        # Equation 36 
+        sigma_1 = (self.sigma0/A) * p * x**(-5/2)
+        sigma_2_top = 1 + V**(-2)*p*(x**(-9/2))
+        sigma_2_bottom = 1 +p*(x**(-5/2))
+        sigma = sigma_1 * (sigma_2_top/sigma_2_bottom)**(1/4)
+
+        # Equation 37 more
+        sig = A * sigma / self.sigma0
+
+        # Equation 36 Temperature
+        Ttop = sig**2 + 1
+        Tbottom = sig**2 + (V**(3))*(x**(3))
+        T = self.Tevap * (Ttop/Tbottom)**(1/3)
+
+        # Fixing the units
+        self._T = T.decompose().to(u.K)
+        self._T = self._T.value
+        # print("Temp", np.sum(self._T))
+        self._set_arrays()
+        return self._T
+
+    def set_grid(self, grid):
+        self._R = grid.Rc
+        self._T = None
+
+    def update(self, dt, Sigma, amax=1e-5, star=None):
+        self._time += dt
+        self._T = self.calculate_T(dt, star)
+        self._set_arrays()
+
+    def set_grid(self, grid):
+        self._R = grid.Rc
+        self._T = None
+
+    def _Omega(self, R):
+        Omega = self._star.Omega_k(R)
+        return Omega
+    
+    def _calculate_alpha(self):
+        cs0_val = ((Constants.gamma)*(Constants.boltz)*Config.T0/(Constants.mu*Constants.mH))**0.5 # sound speed from ideal gas law at ref temp; cs^2=gamma*kt/(mu*mH)
+        cs0_val = cs0_val.to(u.cm/u.s)
+        Omega_ref = self._star.Omega_k(Config.r0.value) * (2*np.pi) / u.yr # keplerian frequency at reference radius, in proper units given docs of func
+        alpha_turb = (1 - Config.fw)*Config.r0*Config.v0*Omega_ref / (cs0_val**2) 
+        alpha_wind = Config.fw*Config.v0 / (cs0_val)
+        alpha = alpha_turb  + alpha_wind
+        alpha_t = alpha.decompose()
+        return alpha_t
+
+    def _f_cs(self, R):
+        k_B = Constants.boltz
+        m_H = Constants.mH
+        T = self._T*u.K
+        cs = (k_B*T/(Constants.mu*m_H))**0.5
+        cs = cs.to(u.AU/u.yr)/(2*np.pi)
+        cs = cs.value
+        return cs
+
+    def _f_alpha(self, R):
+        self._alpha_t = self._calculate_alpha()
+        return self._alpha_t
+    
+    def _f_H(self, R):
+        Omega = self._Omega(R)
+        _H = self._f_cs(R)/Omega
+        return _H
+    
+    def _f_nu(self, R):
+        alpha = self._f_alpha(R)
+        H = self._f_H(R)
+        Omega = self._Omega(R)
+        return alpha*H**2*Omega
+
+    @property
+    def T(self):
+        return self._T
+
+    @property
+    def star(self):
+        return self._star
+    
+
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    from .star import SimpleStar
-    from .grid import Grid
+    from DiscEvolution.star import SimpleStar
+    from DiscEvolution.grid import Grid
 
     alpha = 1e-3
     star = SimpleStar(M=1.0, R=3.0, T_eff=4280.)
@@ -550,5 +697,3 @@ if __name__ == "__main__":
         Sigma /= 10
     plt.legend()
     plt.show()
-    
-                    
